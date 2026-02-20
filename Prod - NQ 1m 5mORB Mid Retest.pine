@@ -1,0 +1,235 @@
+//@version=5
+strategy("Prod - NQ 1m 5mORB Mid Retest", 
+     overlay=true, 
+     calc_on_every_tick = true, 
+     process_orders_on_close = false, 
+     commission_type = strategy.commission.cash_per_contract, 
+     commission_value = 5.2)
+
+
+// ==========================================
+// CONFIGURACIÓN DE HORARIOS (NY TIME)
+// ==========================================
+var string TZ = "America/New_York"
+
+// ==========================================
+// PARÁMETROS DE ESTRATEGIA
+// ==========================================
+grp_trading = "Parámetros de Trading"
+float delta_input    = input.float(7.5, "Delta Mínimo (Puntos)", minval=0.0, step=0.5, group=grp_trading)
+float reward_ratio   = input.float(2.2, "Ratio TP (Risk:Reward)", minval=0.1, step=0.1, group=grp_trading)
+
+grp_be = "Gestión de Break Even"
+bool use_be          = input.bool(true, "Activar Break Even", group=grp_be)
+float be_at_r        = input.float(1.0, "Mover a BE al alcanzar R:", minval=0.1, step=0.1, group=grp_be)
+float be_offset      = input.float(3.5, "Plus de BE (Puntos para Comisiones)", minval=0.0, step=0.25, group=grp_be)
+
+grp_risk = "Gestión de Riesgo"
+float risk_usd       = input.float(3000.0, "Riesgo Máximo (USD por Trade)", minval=1.0, step=50.0, group=grp_risk)
+
+grp_filters = "Filtros de Tiempo y Rango"
+float min_orb_handles = input.float(35.0, "Tamaño Mínimo ORB (Handles)", minval=0.0, step=1.0, group=grp_filters)
+// NUEVO: Hora máxima de Breakout
+int max_breakout_time = input.int(1145, "Hora Máxima de Breakout (HHMM)", minval=0935, maxval=1600, step=10,group=grp_filters, tooltip="Si el breakout ocurre después de esta hora, se ignora.")
+
+grp_sessions = "Ventana Operativa (NY Time)"
+string sess_scan     = "0935-1600" 
+string sess_trading  = input.session("0935-1500", "Ventana de Trading (Ejecución)", group=grp_sessions)
+
+// ==========================================
+// LÓGICA DE TIEMPO Y NIVELES
+// ==========================================
+time_ny = hour(time, TZ) * 100 + minute(time, TZ)
+is_orb_bar = hour(time, TZ) == 9 and minute(time, TZ) == 30
+
+var float orb_upper = na
+var float orb_lower = na
+var float orb_mid   = na
+var float orb_size  = na
+
+// VARIABLES DE ESTADO
+var bool breakout_confirmed = false
+var int breakout_dir        = 0 
+var bool order_placed       = false 
+var bool be_activated       = false
+
+// Reset Diario
+if is_orb_bar
+    orb_upper          := na
+    orb_lower          := na
+    orb_mid            := na
+    orb_size           := na
+    breakout_confirmed := false
+    breakout_dir       := 0
+    order_placed       := false
+    be_activated       := false
+    strategy.cancel_all()
+
+calc_orb() => [is_orb_bar ? high : na, is_orb_bar ? low : na]
+[orb_h_raw, orb_l_raw] = request.security(syminfo.tickerid, "5", calc_orb(), lookahead=barmerge.lookahead_on)
+
+val_h = ta.valuewhen(not na(orb_h_raw), orb_h_raw, 0)
+val_l = ta.valuewhen(not na(orb_l_raw), orb_l_raw, 0)
+
+if na(orb_upper) and not na(val_h)
+    orb_upper := val_h
+    orb_lower := val_l
+    orb_mid   := (val_h + val_l) / 2
+    orb_size  := val_h - val_l
+
+bool orb_size_ok = not na(orb_size) and orb_size >= min_orb_handles
+
+// ==========================================
+// CAPA 1: ESCANEO DE BREAKOUT (CON FILTRO DE HORA)
+// ==========================================
+bool is_scanning_window = not na(time(timeframe.period, sess_scan, TZ))
+// FILTRO DE HORA MÁXIMA
+bool within_breakout_limit = time_ny <= max_breakout_time
+
+if is_scanning_window and not breakout_confirmed and orb_size_ok and within_breakout_limit
+    // Confirmación Long
+    if low > (orb_upper + delta_input)
+        breakout_confirmed := true
+        breakout_dir       := 1
+        label.new(bar_index, high, "BULL BREAK", color=color.green, textcolor=color.white, style=label.style_label_down)
+    
+    // Confirmación Short
+    else if high < (orb_lower - delta_input)
+        breakout_confirmed := true
+        breakout_dir       := -1
+        label.new(bar_index, low, "BEAR BREAK", color=color.red, textcolor=color.white, style=label.style_label_up)
+
+// ==========================================
+// CAPA 2: EJECUCIÓN
+// ==========================================
+bool is_trading_window = not na(time(timeframe.period, sess_trading, TZ))
+
+get_qty(points) =>
+    float point_value = syminfo.pointvalue
+    float risk_per_contract = points * point_value
+    int calculated_qty = math.floor(risk_usd / risk_per_contract)
+    calculated_qty > 0 ? calculated_qty : 0
+
+if is_trading_window and breakout_confirmed and not order_placed and strategy.position_size == 0
+    if breakout_dir == 1 
+        float points_risk = orb_mid - orb_lower
+        int pos_qty = get_qty(points_risk)
+        if pos_qty > 0
+            strategy.entry("Long", strategy.long, qty=pos_qty, limit=orb_mid, comment="V39 Retest Mid")
+            order_placed := true
+            
+    else if breakout_dir == -1 
+        float points_risk = orb_upper - orb_mid
+        int pos_qty = get_qty(points_risk)
+        if pos_qty > 0
+            strategy.entry("Short", strategy.short, qty=pos_qty, limit=orb_mid, comment="V39 Retest Mid")
+            order_placed := true
+
+if ta.change(is_trading_window) and not is_trading_window
+    strategy.cancel_all()
+
+// ==========================================
+// GESTIÓN DE SALIDAS (CON BE OFFSET)
+// ==========================================
+if strategy.position_size != 0
+    float entry_p = strategy.position_avg_price
+    float current_qty = math.abs(strategy.position_size)
+    
+    if strategy.position_size > 0 
+        float risk = entry_p - orb_lower
+        // Disparador de BE
+        if use_be and not be_activated and close >= (entry_p + (risk * be_at_r))
+            be_activated := true
+        
+        // El Stop dinámico: Si BE está activo, usa entry_p + offset. Si no, usa orb_lower.
+        float stop_price = be_activated ? (entry_p + be_offset) : orb_lower
+        strategy.exit("ExL", "Long", qty=current_qty, stop = stop_price, limit = entry_p + (risk * reward_ratio),comment_loss=be_activated ? "BE": "SL",comment_profit="TP")
+
+    else if strategy.position_size < 0 
+        float risk = orb_upper - entry_p
+        // Disparador de BE
+        if use_be and not be_activated and close <= (entry_p - (risk * be_at_r))
+            be_activated := true
+        
+        // El Stop dinámico: Si BE está activo, usa entry_p - offset. Si no, usa orb_upper.
+        float stop_price = be_activated ? (entry_p - be_offset) : orb_upper
+        strategy.exit("ExS", "Short", qty=current_qty, stop = stop_price, limit = entry_p - (risk * reward_ratio),comment_loss=be_activated ? "BE": "SL",comment_profit="TP")
+
+// Cierre EOD
+if time_ny >= 1600
+    strategy.close_all("EOD")
+    strategy.cancel_all()
+
+
+
+
+// ==========================================
+// PANEL ESTADÍSTICO (SOLO MÉTRICAS)
+// No es posible recuperar trades mas alla de Last Avaliable Bar.
+// ==========================================
+// Reducimos la tabla a 2 columnas para limpiar la interfaz
+var table stat_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 10), border_width=1, border_color=color.gray)
+
+if barstate.islast
+    int wins = 0
+    int losses = 0
+    int bes = 0
+    float gross_profit = 0.0
+    float gross_loss = 0.0
+    
+    if strategy.closedtrades > 0
+        for i = 0 to strategy.closedtrades - 1
+            float pnl = strategy.closedtrades.profit(i)
+            string comm = strategy.closedtrades.exit_comment(i)
+            
+            if comm == "TP"
+                wins += 1
+                gross_profit += pnl
+            else if comm == "BE"
+                bes += 1
+                if pnl >= 0 
+                    gross_profit += pnl 
+                else 
+                    gross_loss += math.abs(pnl)
+            else if comm == "SL"
+                losses += 1
+                gross_loss += math.abs(pnl)
+            else
+                if pnl > 0
+                    wins += 1
+                    gross_profit += pnl
+                else
+                    losses += 1
+                    gross_loss += math.abs(pnl)
+
+    float pf = gross_loss == 0 ? gross_profit : gross_profit / gross_loss
+
+    // Dibujar Tabla de Métricas
+    table.cell(stat_table, 0, 0, "Métrica (Trades Disp.)", text_color=color.white, text_size=size.small)
+    table.cell(stat_table, 1, 0, "Valor", text_color=color.white, text_size=size.small)
+    
+    table.cell(stat_table, 0, 1, "Ganadores (TP)", text_color=color.green, text_halign=text.align_left)
+    table.cell(stat_table, 1, 1, str.tostring(wins), text_color=color.green)
+    
+    table.cell(stat_table, 0, 2, "Perdedores (SL)", text_color=color.red, text_halign=text.align_left)
+    table.cell(stat_table, 1, 2, str.tostring(losses), text_color=color.red)
+    
+    table.cell(stat_table, 0, 3, "Break Even (BE)", text_color=color.blue, text_halign=text.align_left)
+    table.cell(stat_table, 1, 3, str.tostring(bes), text_color=color.blue)
+    
+    table.cell(stat_table, 0, 4, "Profit Factor", text_color=color.yellow, text_halign=text.align_left)
+    table.cell(stat_table, 1, 4, str.tostring(pf, "#.##"), text_color=color.yellow)
+    
+    table.cell(stat_table, 0, 5, "Total en Gráfico", text_color=color.gray, text_halign=text.align_left)
+    table.cell(stat_table, 1, 5, str.tostring(strategy.closedtrades), text_color=color.gray)
+
+// ==========================================
+// VISUALIZACIÓN
+// ==========================================
+plot(orb_upper, "ORB High", color=color.new(color.blue, 0), style=plot.style_linebr)
+plot(orb_lower, "ORB Low", color=color.new(color.blue, 0), style=plot.style_linebr)
+plot(orb_mid, "Midpoint (Entry)", color=color.new(color.gray, 0), style=plot.style_linebr, linewidth=2)
+
+// Línea visual para la hora límite de breakout
+vline_color = time_ny == max_breakout_time ? color.red : na
+bgcolor(within_breakout_limit ? color.new(color.green, 98) : na)
