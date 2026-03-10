@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
@@ -38,6 +39,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private double stopPrecioFinal = 0;
 		private double targetPrecioFinal = 0;
 		private double stopDistanciaTicks = 0; //
+		private string logFilePath;
+        private string executionEnv;
 
         #region Parámetros
         [NinjaScriptProperty]
@@ -81,6 +84,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[NinjaScriptProperty]
 		[Display(Name="Latencia Máxima (ms)", GroupName="Parámetros", Order=13)]
 		public int latencia { get; set; } = 500;
+		
+		[NinjaScriptProperty]
+        [Display(Name = "Log a Disco Activado", GroupName = "4. Debug", Order = 0)]
+        public bool IsFileLogEnabled { get; set; }
+		
         #endregion
 
         protected override void OnStateChange()
@@ -95,13 +103,22 @@ namespace NinjaTrader.NinjaScript.Strategies
 				BeOffset = 3.5;
 				latencia = 500; // Valor inicial por defecto: 500ms
 				MaxBreakoutTimeHHMM=01145;
-				
+				IsFileLogEnabled = true;
             }
             else if (State == State.Configure)
             {
                 AddDataSeries(BarsPeriodType.Minute, 5);
 				// Nueva serie para el Break Even (BarsArray[2]): 1 Segundo
     			AddDataSeries(BarsPeriodType.Second, 1);
+            }
+			else if (State == State.DataLoaded)
+            {
+                // Configurar ruta de archivo: Documentos/NinjaTrader 8/bin/CustomLogs/
+                string folder = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "CustomLogs");
+                if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+                logFilePath = Path.Combine(folder, string.Format("Log_{0}_{1}.txt", Name, DateTime.Now.ToString("yyyyMMdd")));
+                
+                CustomLog("--- INICIO DE ESTRATEGIA EN MODO " + executionEnv + " ---");
             }
             else if (State == State.Terminated)
             {
@@ -302,7 +319,7 @@ protected override void OnBarUpdate()
                 panicButton.Click += (s, e) => 
 					{
 						string msg = string.Format("LOG-10: Panic Button Pressed!!!");
-		        		Print("[" + Time[0].ToString("yyyy-MM-dd HH:mm:ss") + "] " + msg);	
+		        		CustomLog("[" + Time[0].ToString("yyyy-MM-dd HH:mm:ss") + "] " + msg);	
 						LiquidateEverything(); 
 						currentRobotState = RobotState.SessionClosed; 		        
 					};
@@ -412,12 +429,12 @@ protected override void OnBarUpdate()
 		        {
 		            SetStopLoss("OrbEntry", CalculationMode.Price, precioProteccionBE, false);
 		            beTriggered = true;
-		            Print(string.Format("[{0}] LOG-05: BE activado. SL movido a {1}", Time[0], precioProteccionBE));
+		            CustomLog(string.Format("[{0}] LOG-05: BE activado. SL movido a {1}", Time[0], precioProteccionBE));
 		        }
 		        // Caso B: El precio ya regresó y cruzó el nivel de BE (Rebote violento)
 		        else 
 		        {
-		            Print(string.Format("[{0}] LOG-05: BE Gatillado pero precio rebotó a {1}. Liquidando a mercado.", Time[0], precioActual));
+		            CustomLog(string.Format("[{0}] LOG-05: BE Gatillado pero precio rebotó a {1}. Liquidando a mercado.", Time[0], precioActual));
 		            
 		            if (breakoutDir == 1) ExitLong("BE Market Close", "");
 		            else ExitShort("BE Market Close", "");
@@ -479,7 +496,39 @@ protected override void OnBarUpdate()
         }
 
         protected override void OnPositionUpdate(Position position, double averagePrice, int quantity, MarketPosition marketPosition) { }
-    
+        // METODO CENTRALIZADO DE LOGGING
+        
+		private void CustomLog(string message)
+        {
+            string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"); // FECHAHORA DE IMPRESION. NO LA NECESITAMOS SOLO USAMOS LA FECHA DE LOS DATOS. 
+			string strategyname="NQ1mOrbBreakRestet";
+				
+			
+			string modoEjecucion;
+			if (State == State.Historical) 
+    			modoEjecucion = "HISTORICAL";
+			else if (Connection.PlaybackConnection.Status == Cbi.ConnectionStatus.Connected)
+    			modoEjecucion = "PLAYBACK";
+			else if (State==State.Realtime)
+    				modoEjecucion = "REALTIME"; // Puede ser Sim o Real
+			else
+    			modoEjecucion = "OTRO";
+			
+            string formattedMessage = string.Format("[{0}] [{1}] [{2}] {3}", strategyname, modoEjecucion, currentRobotState, message);
+
+            // 1. Consola de Output
+            Print(formattedMessage);
+
+            // 2. Log de NinjaTrader (Control Center)
+            Log(formattedMessage, LogLevel.Information);
+
+            // 3. Archivo a Disco
+            if (IsFileLogEnabled && !string.IsNullOrEmpty(logFilePath))
+            {
+                try { File.AppendAllText(logFilePath, formattedMessage + Environment.NewLine); }
+                catch { /* Evitar bloqueos de acceso a archivo */ }
+            }
+        }
 
 		private void ChangeRobotState(RobotState newState, string customMsg = "")
 		{
@@ -489,7 +538,7 @@ protected override void OnBarUpdate()
 		    string timestamp = Time[0].ToString("yyyy-MM-dd HH:mm:ss");
 		    string logMsg = string.Format("[{0}] [{1}] {2}", timestamp, newState, customMsg);
 		
-		    Print(logMsg);
+		    CustomLog(logMsg);
 		    Log(logMsg, LogLevel.Information);
 		
 		    currentRobotState = newState;
@@ -502,7 +551,7 @@ protected override void OnBarUpdate()
 		        if (execution.Order.OrderState == OrderState.Filled || execution.Order.OrderState == OrderState.PartFilled)
 		        {
 		            string msg = string.Format("LOG-04: Ejecución detectada. Qty Ejecutada: {0} a {1}", execution.Quantity, execution.Price);
-		            Print("[" + time.ToString("yyyy-MM-dd HH:mm:ss") + "] " + msg);
+		            CustomLog("[" + time.ToString("yyyy-MM-dd HH:mm:ss") + "] " + msg);
 		        }
 		    }
 		
@@ -522,7 +571,7 @@ protected override void OnBarUpdate()
 		        string msg = string.Format("LOG-06: Trade cerrado por {0} en {1}. PnL: {2} pts (${3} USD)", 
 		                     motivo, price, pnlPoints.ToString("F2"), pnlCash.ToString("N2"));
 		        
-		        Print("[" + time.ToString("yyyy-MM-dd HH:mm:ss") + "] " + msg);
+		        CustomLog("[" + time.ToString("yyyy-MM-dd HH:mm:ss") + "] " + msg);
 		        tradeExecutedToday = false; // Reset para evitar logs duplicados
 		    }
 		}
